@@ -43,7 +43,6 @@ deps.linux.amd64:
 
 .PHONY: deps.windows.x64
 deps.windows.x64:
-	if [ "$(shell uname -s | tr '[:upper:]' '[:lower:]')" != "windows" ]; then echo "Error: must run build on windows"; false; fi
 	g++ -std=c++11 -O3 -DGODUCKDB_FROM_SOURCE -c duckdb.cpp
 	ar rvs libduckdb.a duckdb.o
 	mv libduckdb.a deps/windows_x64/libduckdb.a
