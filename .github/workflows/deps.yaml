@@ -3,10 +3,10 @@ on:
   push:
     branches-ignore:
       - master
-    paths:
-      - "duckdb.cpp"
-      - "duckdb.h"
-      - "duckdb.hpp"
+    # paths:
+    #   - "duckdb.cpp"
+    #   - "duckdb.h"
+    #   - "duckdb.hpp"
 jobs:
   darwin_amd64:
     runs-on: macos-latest
