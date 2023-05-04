@@ -5,11 +5,11 @@ on:
   push:
     branches-ignore:
       - master
-#    paths:
-#      - ".github/workflows/**"
-#      - "duckdb.cpp"
-#      - "duckdb.h"
-#      - "duckdb.hpp"
+    paths:
+      - ".github/workflows/**"
+      - "duckdb.cpp"
+      - "duckdb.h"
+      - "duckdb.hpp"
 jobs:
   darwin_amd64:
     runs-on: macos-latest
