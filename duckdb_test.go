@@ -1,11 +1,15 @@
 package duckdb
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
+	"reflect"
 	"testing"
 	"time"
 
@@ -38,14 +42,116 @@ func TestOpen(t *testing.T) {
 		require.Equal(t, "read_write", accessMode)
 	})
 
+	t.Run("existing sqlite database", func(t *testing.T) {
+		db, err := sql.Open("duckdb", "sqlite:testdata/pets.sqlite")
+		require.NoError(t, err)
+		defer db.Close()
+
+		var species string
+		res := db.QueryRow("SELECT species FROM pets WHERE id=1")
+		require.NoError(t, res.Scan(&species))
+		require.Equal(t, "Gopher", species)
+	})
+
 	t.Run("with invalid config", func(t *testing.T) {
-		db, _ := sql.Open("duckdb", "?threads=NaN")
-		err := db.Ping()
+		_, err := sql.Open("duckdb", "?threads=NaN")
 
 		if !errors.Is(err, prepareConfigError) {
 			t.Fatal("invalid config should not be accepted")
 		}
 	})
+}
+
+func TestConnPool(t *testing.T) {
+	db := openDB(t)
+	db.SetMaxOpenConns(2) // set connection pool size greater than 1
+	defer db.Close()
+	createTable(db, t)
+
+	// Get two separate connections and check they're consistent
+	conn1, err := db.Conn(context.Background())
+	require.NoError(t, err)
+	conn2, err := db.Conn(context.Background())
+	require.NoError(t, err)
+
+	res, err := conn1.ExecContext(context.Background(), "INSERT INTO foo VALUES ('lala', ?), ('lalo', ?)", 12345, 1234)
+	require.NoError(t, err)
+	ra, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(2), ra)
+
+	require.NoError(t, err)
+	rows, err := conn1.QueryContext(context.Background(), "select bar from foo limit 1")
+	require.NoError(t, err)
+	require.True(t, rows.Next())
+	rows.Close()
+
+	require.NoError(t, err)
+	rows, err = conn2.QueryContext(context.Background(), "select bar from foo limit 1")
+	require.NoError(t, err)
+	require.True(t, rows.Next())
+	rows.Close()
+
+	err = conn1.Close()
+	require.NoError(t, err)
+	err = conn2.Close()
+	require.NoError(t, err)
+}
+
+func TestConnInit(t *testing.T) {
+	connector, err := NewConnector("", func(execer driver.ExecerContext) error {
+		bootQueries := []string{
+			"INSTALL 'json'",
+			"LOAD 'json'",
+		}
+
+		for _, qry := range bootQueries {
+			_, err := execer.ExecContext(context.Background(), qry, nil)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	db := sql.OpenDB(connector)
+	db.SetMaxOpenConns(2) // set connection pool size greater than 1
+	defer db.Close()
+
+	// Get two separate connections and check they're consistent
+	conn1, err := db.Conn(context.Background())
+	require.NoError(t, err)
+	conn2, err := db.Conn(context.Background())
+	require.NoError(t, err)
+
+	res, err := conn1.ExecContext(context.Background(), "CREATE TABLE example (j JSON)")
+	require.NoError(t, err)
+	ra, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), ra)
+
+	res, err = conn2.ExecContext(context.Background(), "INSERT INTO example VALUES(' { \"family\": \"anatidae\", \"species\": [ \"duck\", \"goose\", \"swan\", null ] }')")
+	require.NoError(t, err)
+	ra, err = res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), ra)
+
+	require.NoError(t, err)
+	rows, err := conn1.QueryContext(context.Background(), "SELECT json_valid(j) FROM example")
+	require.NoError(t, err)
+	require.True(t, rows.Next())
+	rows.Close()
+
+	require.NoError(t, err)
+	rows, err = conn2.QueryContext(context.Background(), "SELECT json_valid(j) FROM example")
+	require.NoError(t, err)
+	require.True(t, rows.Next())
+	rows.Close()
+
+	err = conn1.Close()
+	require.NoError(t, err)
+	err = conn2.Close()
+	require.NoError(t, err)
 }
 
 func TestExec(t *testing.T) {
@@ -191,6 +297,12 @@ func TestMap(t *testing.T) {
 		}, m)
 	})
 
+	t.Run("select nested map", func(t *testing.T) {
+		var m Map
+		err := db.QueryRow("SELECT map([map([1], [1]), map([2], [2])], ['a', 'e'])").Scan(&m)
+		require.ErrorIs(t, err, errUnsupportedMapKeyType)
+	})
+
 	t.Run("insert map", func(t *testing.T) {
 		tests := []struct {
 			sqlType string
@@ -333,9 +445,11 @@ func TestENUMs(t *testing.T) {
 	_, err = db.Exec("INSERT INTO vehicles VALUES (?, ?), (?, ?)", "Aircraft", "Air", "Boat", "Sea")
 	require.NoError(t, err)
 
-	var str string
-	require.NoError(t, db.QueryRow("SELECT name FROM vehicles WHERE environment = ?", "Air").Scan(&str))
-	require.Equal(t, "Aircraft", str)
+	var name string
+	var env string
+	require.NoError(t, db.QueryRow("SELECT name, CAST(environment AS text) FROM vehicles WHERE environment = ?", "Air").Scan(&name, &env))
+	require.Equal(t, "Aircraft", name)
+	require.Equal(t, "Air", env)
 }
 
 func TestHugeInt(t *testing.T) {
@@ -343,32 +457,45 @@ func TestHugeInt(t *testing.T) {
 	db := openDB(t)
 	defer db.Close()
 
-	t.Run("scan HugeInt", func(t *testing.T) {
-		for _, expected := range []int64{0, 1, -1, math.MaxInt64, math.MinInt64} {
-			t.Run(fmt.Sprintf("sum(%d)", expected), func(t *testing.T) {
-				var res HugeInt
-				err := db.QueryRow("SELECT SUM(?)", expected).Scan(&res)
+	t.Run("scan hugeint", func(t *testing.T) {
+		tests := []string{
+			"0",
+			"1",
+			"-1",
+			"9223372036854775807",
+			"-9223372036854775808",
+			"170141183460469231731687303715884105727",
+			"-170141183460469231731687303715884105727",
+		}
+		for _, expected := range tests {
+			t.Run(expected, func(t *testing.T) {
+				var res *big.Int
+				err := db.QueryRow(fmt.Sprintf("SELECT %s::HUGEINT", expected)).Scan(&res)
 				require.NoError(t, err)
-
-				expct, err := res.Int64()
-				require.NoError(t, err)
-				require.Equal(t, expected, expct)
+				require.Equal(t, expected, res.String())
 			})
 		}
 	})
 
-	t.Run("bind HugeInt", func(t *testing.T) {
+	t.Run("bind hugeint", func(t *testing.T) {
 		_, err := db.Exec("CREATE TABLE hugeint_test (number HUGEINT)")
 		require.NoError(t, err)
 
-		val := HugeInt{upper: 1, lower: 2}
+		val := big.NewInt(1)
+		val.SetBit(val, 101, 1)
 		_, err = db.Exec("INSERT INTO hugeint_test VALUES(?)", val)
 		require.NoError(t, err)
 
-		var res HugeInt
+		var res *big.Int
 		err = db.QueryRow("SELECT number FROM hugeint_test WHERE number = ?", val).Scan(&res)
 		require.NoError(t, err)
-		require.Equal(t, val, res)
+		require.Equal(t, val.String(), res.String())
+
+		tooHuge := big.NewInt(1)
+		tooHuge.SetBit(tooHuge, 129, 1)
+		_, err = db.Exec("INSERT INTO hugeint_test VALUES(?)", tooHuge)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "too big")
 	})
 }
 
@@ -469,7 +596,7 @@ func TestJSON(t *testing.T) {
 		}{
 			Foo: "bar",
 		})
-		require.NoError(t, db.QueryRow(`SELECT ?::JSON->>'foo'`, val).Scan(&data))
+		require.NoError(t, db.QueryRow(`SELECT ?::JSON->>'foo'`, string(val)).Scan(&data))
 		require.Equal(t, "bar", data)
 	})
 
@@ -482,7 +609,6 @@ func TestJSON(t *testing.T) {
 		require.Equal(t, len(items), 2)
 		require.Equal(t, items, []string{"foo", "bar"})
 	})
-
 }
 
 // CAST(? as DATE) generate result of type Date (time.Time)
@@ -600,6 +726,194 @@ func TestMultiple(t *testing.T) {
 	_, err = db.Exec("INSERT INTO foo VALUES (?); INSERT INTO bar VALUES (?);", "hello", "world")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Cannot prepare multiple statements at once")
+}
+
+func TestTypeNamesAndScanTypes(t *testing.T) {
+	tests := []struct {
+		sql      string
+		value    any
+		typeName string
+	}{
+		// DUCKDB_TYPE_BOOLEAN
+		{
+			sql:      "SELECT true AS col",
+			value:    true,
+			typeName: "BOOLEAN",
+		},
+		// DUCKDB_TYPE_TINYINT
+		{
+			sql:      "SELECT 31::TINYINT AS col",
+			value:    int8(31),
+			typeName: "TINYINT",
+		},
+		// DUCKDB_TYPE_SMALLINT
+		{
+			sql:      "SELECT 31::SMALLINT AS col",
+			value:    int16(31),
+			typeName: "SMALLINT",
+		},
+		// DUCKDB_TYPE_INTEGER
+		{
+			sql:      "SELECT 31::INTEGER AS col",
+			value:    int32(31),
+			typeName: "INTEGER",
+		},
+		// DUCKDB_TYPE_BIGINT
+		{
+			sql:      "SELECT 31::BIGINT AS col",
+			value:    int64(31),
+			typeName: "BIGINT",
+		},
+		// DUCKDB_TYPE_UTINYINT
+		{
+			sql:      "SELECT 31::UTINYINT AS col",
+			value:    uint8(31),
+			typeName: "UTINYINT",
+		},
+		// DUCKDB_TYPE_USMALLINT
+		{
+			sql:      "SELECT 31::USMALLINT AS col",
+			value:    uint16(31),
+			typeName: "USMALLINT",
+		},
+		// DUCKDB_TYPE_UINTEGER
+		{
+			sql:      "SELECT 31::UINTEGER AS col",
+			value:    uint32(31),
+			typeName: "UINTEGER",
+		},
+		// DUCKDB_TYPE_UBIGINT
+		{
+			sql:      "SELECT 31::UBIGINT AS col",
+			value:    uint64(31),
+			typeName: "UBIGINT",
+		},
+		// DUCKDB_TYPE_FLOAT
+		{
+			sql:      "SELECT 3.14::FLOAT AS col",
+			value:    float32(3.14),
+			typeName: "FLOAT",
+		},
+		// DUCKDB_TYPE_DOUBLE
+		{
+			sql:      "SELECT 3.14::DOUBLE AS col",
+			value:    float64(3.14),
+			typeName: "DOUBLE",
+		},
+		// DUCKDB_TYPE_TIMESTAMP
+		{
+			sql:      "SELECT '1992-09-20 11:30:00'::TIMESTAMP AS col",
+			value:    time.Date(1992, 9, 20, 11, 30, 0, 0, time.UTC),
+			typeName: "TIMESTAMP",
+		},
+		// DUCKDB_TYPE_DATE
+		{
+			sql:      "SELECT '1992-09-20'::DATE AS col",
+			value:    time.Date(1992, 9, 20, 0, 0, 0, 0, time.UTC),
+			typeName: "DATE",
+		},
+		// DUCKDB_TYPE_TIME
+		{
+			sql:      "SELECT '11:30:00'::TIME AS col",
+			value:    time.Date(1970, 1, 1, 11, 30, 0, 0, time.UTC),
+			typeName: "TIME",
+		},
+		// DUCKDB_TYPE_INTERVAL
+		{
+			sql:      "SELECT INTERVAL 15 MINUTES AS col",
+			value:    Interval{Micros: 15 * 60 * 1000000},
+			typeName: "INTERVAL",
+		},
+		// DUCKDB_TYPE_HUGEINT
+		{
+			sql:      "SELECT 31::HUGEINT AS col",
+			value:    big.NewInt(31),
+			typeName: "HUGEINT",
+		},
+		// DUCKDB_TYPE_VARCHAR
+		{
+			sql:      "SELECT 'foo'::VARCHAR AS col",
+			value:    "foo",
+			typeName: "VARCHAR",
+		},
+		// DUCKDB_TYPE_BLOB
+		{
+			sql:      "SELECT 'foo'::BLOB AS col",
+			value:    []byte("foo"),
+			typeName: "BLOB",
+		},
+		// DUCKDB_TYPE_DECIMAL
+		{
+			sql:      "SELECT 31::DECIMAL(30,20) AS col",
+			value:    float64(31),
+			typeName: "DECIMAL(30,20)",
+		},
+		// DUCKDB_TYPE_TIMESTAMP_S
+		{
+			sql:      "SELECT '1992-09-20 11:30:00'::TIMESTAMP_S AS col",
+			value:    time.Date(1992, 9, 20, 11, 30, 0, 0, time.UTC),
+			typeName: "TIMESTAMP_S",
+		},
+		// DUCKDB_TYPE_TIMESTAMP_MS
+		{
+			sql:      "SELECT '1992-09-20 11:30:00'::TIMESTAMP_MS AS col",
+			value:    time.Date(1992, 9, 20, 11, 30, 0, 0, time.UTC),
+			typeName: "TIMESTAMP_MS",
+		},
+		// DUCKDB_TYPE_TIMESTAMP_NS
+		{
+			sql:      "SELECT '1992-09-20 11:30:00'::TIMESTAMP_NS AS col",
+			value:    time.Date(1992, 9, 20, 11, 30, 0, 0, time.UTC),
+			typeName: "TIMESTAMP_NS",
+		},
+		// DUCKDB_TYPE_LIST
+		{
+			sql:      "SELECT [['duck', 'goose', 'heron'], NULL, ['frog', 'toad'], []] AS col",
+			value:    []any{[]any{"duck", "goose", "heron"}, nil, []any{"frog", "toad"}, []any{}},
+			typeName: "VARCHAR[][]",
+		},
+		// DUCKDB_TYPE_STRUCT
+		{
+			sql:      "SELECT {'key1': 'string', 'key2': 1, 'key3': 12.345::DOUBLE} AS col",
+			value:    map[string]any{"key1": "string", "key2": int32(1), "key3": float64(12.345)},
+			typeName: `STRUCT("key1" VARCHAR, "key2" INTEGER, "key3" DOUBLE)`,
+		},
+		{
+			sql:      `SELECT {'key1 (,) \ \" "" "': 1} AS col`,
+			value:    map[string]any{`key1 (,) \ \" "" "`: int32(1)},
+			typeName: `STRUCT("key1 (,) \ \"" """" """ INTEGER)`,
+		},
+		// DUCKDB_TYPE_MAP
+		{
+			sql:      "SELECT map([1, 5], ['a', 'e']) AS col",
+			value:    Map{int32(1): "a", int32(5): "e"},
+			typeName: "MAP(INTEGER, VARCHAR)",
+		},
+		// DUCKDB_TYPE_UUID
+		{
+			sql:      "SELECT '53b4e983-b287-481a-94ad-6e3c90489913'::UUID AS col",
+			value:    []byte{0x53, 0xb4, 0xe9, 0x83, 0xb2, 0x87, 0x48, 0x1a, 0x94, 0xad, 0x6e, 0x3c, 0x90, 0x48, 0x99, 0x13},
+			typeName: "UUID",
+		},
+	}
+
+	db := openDB(t)
+	for _, test := range tests {
+		t.Run(test.typeName, func(t *testing.T) {
+			rows, err := db.Query(test.sql)
+			require.NoError(t, err)
+
+			cols, err := rows.ColumnTypes()
+			require.NoError(t, err)
+			require.Equal(t, reflect.TypeOf(test.value), cols[0].ScanType())
+			require.Equal(t, test.typeName, cols[0].DatabaseTypeName())
+
+			var val any
+			require.True(t, rows.Next())
+			rows.Scan(&val)
+			require.Equal(t, test.value, val)
+		})
+	}
 }
 
 func openDB(t *testing.T) *sql.DB {
