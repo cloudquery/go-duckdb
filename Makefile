@@ -40,3 +40,9 @@ deps.linux.amd64:
 	g++ -std=c++11 -O3 -DGODUCKDB_FROM_SOURCE -c duckdb.cpp
 	ar rvs libduckdb.a duckdb.o
 	mv libduckdb.a deps/linux_amd64/libduckdb.a
+
+.PHONY: deps.windows.amd64
+deps.windows.amd64:
+	g++ -std=c++11 -O2 -DGODUCKDB_FROM_SOURCE -D_WIN32 -DDUCKDB_BUILD_LIBRARY -Wa,-mbig-obj -c duckdb.cpp
+	ar rvs libduckdb.a duckdb.o
+	mv libduckdb.a deps/windows_amd64/libduckdb.a
