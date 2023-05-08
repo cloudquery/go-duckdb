@@ -8,7 +8,7 @@ package duckdb
 #cgo darwin,arm64 LDFLAGS: -lc++ -L${SRCDIR}/deps/darwin_arm64
 #cgo linux,amd64 LDFLAGS: -lstdc++ -lm -ldl -L${SRCDIR}/deps/linux_amd64
 #cgo windows,amd64 CXXFLAGS: -Wa,-mbig-obj -O2
-#cgo windows,amd64 LDFLAGS: -lstdc++ -lm -L${SRCDIR}/deps/windows_amd64
+#cgo windows,amd64 LDFLAGS: -lstdc++ -L${SRCDIR}/deps/windows_amd64 -l:libduckdb.a
 #include <duckdb.h>
 */
 import "C"
