@@ -38,7 +38,7 @@ jobs:
           path: deps/darwin_arm64/libduckdb.a
           retention-days: 1
   linux_amd64:
-    runs-on: ubuntu-20.04
+    runs-on: large-ubuntu-go-duckdb
     steps:
       - uses: actions/checkout@v3
         with:
@@ -51,7 +51,7 @@ jobs:
           path: deps/linux_amd64/libduckdb.a
           retention-days: 1
   windows_amd64:
-    runs-on: windows-8-cores
+    runs-on: large-windows-go-duckdb
     steps:
       - uses: actions/checkout@v3
         with:
